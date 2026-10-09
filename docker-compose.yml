@@ -1,0 +1,192 @@
+version: '3.8'
+
+services:
+  # ====================================================================
+  # 1. PRIMARY RELATIONAL STORE (PostgreSQL 16)
+  # Persistent storage for users, follows graph, post metadata, comments
+  # ====================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ig_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-instagram_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scale_super_secret_password}
+      POSTGRES_DB: ${POSTGRES_DB:-instagram_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-instagram_admin} -d ${POSTGRES_DB:-instagram_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 2. IN-MEMORY CACHE & TIMELINE STORE (Redis 7)
+  # O(1) Sets for deduplicated likes, Atomic counters, and LRANGE Timelines
+  # ====================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: ig_redis
+    restart: unless-stopped
+    command: >
+      redis-server 
+      --maxmemory 512mb 
+      --maxmemory-policy allkeys-lru 
+      --appendonly yes 
+      --save 60 1000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 3. REDIS VISUAL INSPECTOR (Redis Commander)
+  # Web UI on http://localhost:8081 to inspect live timeline lists & sets
+  # ====================================================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: ig_redis_ui
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 4. DISTRIBUTED EVENT STREAM BROKER (Redpanda / Kafka-compatible)
+  # Ultra-fast C++ Raft-native event streaming (no JVM, no Zookeeper)
+  # ====================================================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: ig_redpanda
+    restart: unless-stopped
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9094
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://localhost:9094
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+      - "9644:9644"
+    volumes:
+      - redpandadata:/var/lib/redpanda/data
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 5. KAFKA & TOPIC INSPECTOR (Redpanda Console)
+  # Web UI on http://localhost:8080 to monitor topics, partitions, and lag
+  # ====================================================================
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: ig_kafka_ui
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: "redpanda:9092"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redpanda
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 6. S3-COMPATIBLE OBJECT STORAGE (MinIO)
+  # High-throughput storage for photos, reels, and video transcoding
+  # ====================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: ig_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_super_secret_password}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web Dashboard
+    volumes:
+      - miniodata:/data
+    networks:
+      - instagram-net
+
+  # MinIO Setup Helper: Initializes 'instagram-media' public bucket
+  create-buckets:
+    image: minio/mc:latest
+    container_name: ig_minio_setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-minio_admin} ${MINIO_ROOT_PASSWORD:-minio_super_secret_password};
+      /usr/bin/mc mb myminio/instagram-media --ignore-existing;
+      /usr/bin/mc anonymous set download myminio/instagram-media;
+      exit 0;
+      "
+    networks:
+      - instagram-net
+
+  # ====================================================================
+  # 7. BACKEND INGESTION SERVICE (Fastify Cluster)
+  # High-concurrency API for post creation, likes, and feed delivery
+  # ====================================================================
+  app-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ig_app_server
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-instagram_admin}:${POSTGRES_PASSWORD:-scale_super_secret_password}@postgres:5432/${POSTGRES_DB:-instagram_db}
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: redpanda:9092
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_started
+      minio:
+        condition: service_started
+    networks:
+      - instagram-net
+
+networks:
+  instagram-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  redpandadata:
+  miniodata:
